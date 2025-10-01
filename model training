@@ -1,0 +1,236 @@
+# ===== Notebook: Apriori training (Snowflake) =====
+# Run in Snowflake Notebook (no external internet required)
+
+from snowflake.snowpark import Session
+import pandas as pd
+import numpy as np
+from itertools import combinations
+from collections import defaultdict
+import math
+
+# ---------------------------
+# Config: adjust thresholds
+# ---------------------------
+MIN_SUPPORT = 0.01        # minimum support (fraction) for frequent itemsets
+MIN_CONFIDENCE = 0.2      # minimum confidence for association rules
+TOP_K_RULES = 5           # keep top K rules per segment & antecedent
+
+# ---------------------------
+# Helpers: segmentation
+# ---------------------------
+def age_group(age):
+    if age < 25: return "18-24"
+    elif age < 40: return "25-39"
+    elif age < 55: return "40-54"
+    else: return "55+"
+
+def salary_band(sal):
+    # adjust bands to your currency/scale
+    if sal < 50000: return "<50K"
+    elif sal < 150000: return "50K-150K"
+    else: return "150K+"
+
+# ---------------------------
+# Apriori utilities (pure python)
+# ---------------------------
+def get_itemset_transactions(df):
+    """Build list of transactions (each transaction is a set of items) from dataframe.
+       We combine CURRENT_PRODUCT + BROWSED_PRODUCTS (split by comma) + EXISTING_LOANS (if not 'None')."""
+    transactions = []
+    for _, r in df.iterrows():
+        items = set()
+        # Current product (anchor)
+        if pd.notna(r.get("CURRENT_PRODUCT")):
+            items.add(str(r["CURRENT_PRODUCT"]).strip())
+        # Browsed products: comma separated string
+        bp = r.get("BROWSED_PRODUCTS")
+        if pd.notna(bp):
+            for it in str(bp).split(","):
+                it = it.strip()
+                if it:
+                    items.add(it)
+        # Existing loans (if 'None' skip)
+        ex = r.get("EXISTING_LOANS")
+        if pd.notna(ex) and str(ex).lower() != "none":
+            items.add(str(ex).strip())
+        transactions.append(items)
+    return transactions
+
+def apriori(transactions, min_support):
+    """Return frequent itemsets dict: {k: {frozenset(itemset): support_count}}"""
+    n = len(transactions)
+    # 1-item counts
+    item_counts = defaultdict(int)
+    for t in transactions:
+        for item in t:
+            item_counts[frozenset([item])] += 1
+    # keep frequent 1-itemsets
+    frequent = {}
+    k = 1
+    Lk = {itemset:cnt for itemset,cnt in item_counts.items() if cnt / n >= min_support}
+    frequent[k] = Lk
+    # generate higher order
+    while True:
+        k += 1
+        prev_itemsets = list(frequent[k-1].keys())
+        candidates = set()
+        for i in range(len(prev_itemsets)):
+            for j in range(i+1, len(prev_itemsets)):
+                a = prev_itemsets[i]
+                b = prev_itemsets[j]
+                union = a.union(b)
+                if len(union) == k:
+                    candidates.add(union)
+        candidate_counts = defaultdict(int)
+        for t in transactions:
+            for c in candidates:
+                if c.issubset(t):
+                    candidate_counts[c] += 1
+        Lk = {c:cnt for c,cnt in candidate_counts.items() if cnt / n >= min_support}
+        if not Lk:
+            break
+        frequent[k] = Lk
+    return frequent, n
+
+def generate_rules(frequent, n_transactions, min_confidence):
+    """Generate rules from frequent itemsets. Return list of dicts with antecedent, consequent, support, confidence."""
+    support_counts = {}
+    for k,itemsets in frequent.items():
+        for itemset, cnt in itemsets.items():
+            support_counts[itemset] = cnt
+    rules = []
+    for itemset, cnt in support_counts.items():
+        if len(itemset) < 2:
+            continue
+        itemset_support = cnt / n_transactions
+        items = list(itemset)
+        for r in range(1, len(items)):
+            for antecedent in combinations(items, r):
+                A = frozenset(antecedent)
+                B = itemset.difference(A)
+                if A in support_counts:
+                    conf = support_counts[itemset] / support_counts[A]
+                    if conf >= min_confidence:
+                        rule = {
+                            "ANTECEDENT": A,
+                            "CONSEQUENT": B,
+                            "SUPPORT": itemset_support,
+                            "CONFIDENCE": conf
+                        }
+                        rules.append(rule)
+    rules.sort(key=lambda r: (r["CONFIDENCE"], r["SUPPORT"]), reverse=True)
+    return rules
+
+# ---------------------------
+# Main: read data, segment, run apriori
+# ---------------------------
+session = get_active_session()
+df = session.table("FIN_TABLE").to_pandas()
+
+# Ensure required columns exist
+required_cols = [
+    "AGE","SALARY","RISK_PROFILE","EMPLOYMENT_STATUS",
+    "CURRENT_PRODUCT","BROWSED_PRODUCTS","EXISTING_LOANS"
+]
+for c in required_cols:
+    if c not in df.columns:
+        df[c] = np.nan
+
+# Derive AGE_GROUP and SALARY_BAND
+df["AGE_GROUP"] = df["AGE"].apply(lambda x: age_group(int(x)) if not pd.isna(x) else "UNKNOWN")
+df["SALARY_BAND"] = df["SALARY"].apply(lambda x: salary_band(float(x)) if not pd.isna(x) else "UNKNOWN")
+df["RISK_PROFILE"] = df["RISK_PROFILE"].fillna("UNKNOWN")
+df["EMPLOYMENT_STATUS"] = df["EMPLOYMENT_STATUS"].fillna("UNKNOWN")
+
+# Build segment combinations
+segments = df[["AGE_GROUP","SALARY_BAND","RISK_PROFILE","EMPLOYMENT_STATUS"]].drop_duplicates().to_dict(orient="records")
+
+assoc_rows = []
+global_transactions = get_itemset_transactions(df)
+global_frequent, global_n = apriori(global_transactions, MIN_SUPPORT)
+global_rules = generate_rules(global_frequent, global_n, MIN_CONFIDENCE)
+
+# Global top rules
+global_top = {}
+for r in global_rules:
+    ant = tuple(sorted(list(r["ANTECEDENT"])))
+    for c in r["CONSEQUENT"]:
+        cons = tuple(sorted([c]))
+        key = (ant, cons)
+        score = r["CONFIDENCE"] * r["SUPPORT"]
+        if key not in global_top or global_top[key]["SCORE"] < score:
+            global_top[key] = {
+                "ANTECEDENT": ant,
+                "CONSEQUENT": cons,
+                "SUPPORT": r["SUPPORT"],
+                "CONFIDENCE": r["CONFIDENCE"],
+                "SCORE": score
+            }
+
+for v in global_top.values():
+    assoc_rows.append({
+        "AGE_GROUP": "GLOBAL",
+        "SALARY_BAND": "GLOBAL",
+        "RISK_PROFILE": "GLOBAL",
+        "EMPLOYMENT_STATUS": "GLOBAL",
+        "ANTECEDENT": ",".join(v["ANTECEDENT"]),
+        "CONSEQUENT": ",".join(v["CONSEQUENT"]),
+        "SUPPORT": float(v["SUPPORT"]),
+        "CONFIDENCE": float(v["CONFIDENCE"]),
+        "SCORE": float(v["SCORE"])
+    })
+
+# Per-segment rules
+for seg in segments:
+    seg_df = df[
+        (df["AGE_GROUP"] == seg["AGE_GROUP"]) &
+        (df["SALARY_BAND"] == seg["SALARY_BAND"]) &
+        (df["RISK_PROFILE"] == seg["RISK_PROFILE"]) &
+        (df["EMPLOYMENT_STATUS"] == seg["EMPLOYMENT_STATUS"])
+    ]
+    if len(seg_df) < 50:
+        continue
+    transactions = get_itemset_transactions(seg_df)
+    frequent, n_tr = apriori(transactions, MIN_SUPPORT)
+    rules = generate_rules(frequent, n_tr, MIN_CONFIDENCE)
+    best_rules = {}
+    for r in rules:
+        ant = tuple(sorted(list(r["ANTECEDENT"])))
+        for c in r["CONSEQUENT"]:
+            cons = tuple(sorted([c]))
+            key = (ant, cons)
+            score = r["CONFIDENCE"] * r["SUPPORT"]
+            if key not in best_rules or best_rules[key]["SCORE"] < score:
+                best_rules[key] = {
+                    "ANTECEDENT": ant,
+                    "CONSEQUENT": cons,
+                    "SUPPORT": r["SUPPORT"],
+                    "CONFIDENCE": r["CONFIDENCE"],
+                    "SCORE": score
+                }
+    sorted_rules = sorted(best_rules.values(), key=lambda x: x["SCORE"], reverse=True)[:TOP_K_RULES]
+    for v in sorted_rules:
+        assoc_rows.append({
+            "AGE_GROUP": seg["AGE_GROUP"],
+            "SALARY_BAND": seg["SALARY_BAND"],
+            "RISK_PROFILE": seg["RISK_PROFILE"],
+            "EMPLOYMENT_STATUS": seg["EMPLOYMENT_STATUS"],
+            "ANTECEDENT": ",".join(v["ANTECEDENT"]),
+            "CONSEQUENT": ",".join(v["CONSEQUENT"]),
+            "SUPPORT": float(v["SUPPORT"]),
+            "CONFIDENCE": float(v["CONFIDENCE"]),
+            "SCORE": float(v["SCORE"])
+        })
+
+# Final DataFrame
+assoc_df_out = pd.DataFrame(assoc_rows)
+if assoc_df_out.empty:
+    assoc_df_out = pd.DataFrame(columns=[
+        "AGE_GROUP","SALARY_BAND","RISK_PROFILE","EMPLOYMENT_STATUS",
+        "ANTECEDENT","CONSEQUENT","SUPPORT","CONFIDENCE","SCORE"
+    ])
+
+# Save to Snowflake
+session.write_pandas(assoc_df_out, "PRODUCT_ASSOCIATIONS", auto_create_table=True, overwrite=True)
+
+print("Apriori training done. Saved PRODUCT_ASSOCIATIONS with {} rows.".format(len(assoc_df_out)))
