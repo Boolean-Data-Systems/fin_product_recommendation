@@ -1,0 +1,146 @@
+# ===== Streamlit app: Apriori-based product recommender =====
+import streamlit as st
+import pandas as pd
+from snowflake.snowpark.context import get_active_session
+import numpy as np
+
+st.set_page_config(page_title="Personalized Financial Product Recommendations (Apriori)", layout="wide")
+
+session = get_active_session()
+with st.sidebar:
+    # Logo
+    st.image(
+        "https://booleandata.ai/wp-content/uploads/2022/09/Boolean-logo_Boolean-logo-USA-1.png",
+        use_container_width=True
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # # Model accuracy
+    # st.subheader("📊 Model Accuracy")
+    # st.metric("Hold-out Accuracy", f"{holdout_acc:.2%}")
+
+    # Spacer
+    st.markdown("<br>", unsafe_allow_html=True)
+
+
+# Load associations table (precomputed in notebook)
+@st.cache_data
+def load_assoc():
+    try:
+        return session.table("PRODUCT_ASSOCIATIONS").to_pandas()
+    except Exception as e:
+        st.error("Error loading PRODUCT_ASSOCIATIONS table: {}".format(e))
+        return pd.DataFrame(columns=[
+            "AGE_GROUP","SALARY_BAND","RISK_PROFILE","EMPLOYMENT_STATUS",
+            "ANTECEDENT","CONSEQUENT","SUPPORT","CONFIDENCE","SCORE"
+        ])
+
+assoc_df = load_assoc()
+
+# Load sample stats for KPIs
+@st.cache_data
+def load_stats():
+    try:
+        df = session.table("FIN_TABLE").select(
+            "CURRENT_PRODUCT","RECOMMENDED_PRODUCT","CONVERSION_PROBABILITY","OFFER_AVAILABLE"
+        ).to_pandas()
+        return df
+    except Exception as e:
+        return pd.DataFrame()
+
+stats_df = load_stats()
+
+# Sidebar inputs: profile
+st.sidebar.header("Customer Profile")
+age = st.sidebar.slider("Age", 18, 80, 35)
+salary = st.sidebar.number_input("Annual Salary", min_value=0, value=60000, step=5000)
+risk_profile = st.sidebar.selectbox("Risk Profile", ["Low","Medium","High"])
+employment_status = st.sidebar.selectbox("Employment Status", ["Salaried","Self-Employed","Business","Retired","Other"])
+transaction_type = st.sidebar.selectbox("Recent Transaction Type", sorted(list(stats_df["CURRENT_PRODUCT"].unique()) if not stats_df.empty else ["CREDIT CARD","SAVINGS ACCOUNT","MUTUAL FUND","PERSONAL LOAN"]))
+current_product = st.sidebar.selectbox("Current Product", sorted(list(stats_df["CURRENT_PRODUCT"].unique()) if not stats_df.empty else ["CREDIT CARD","SAVINGS ACCOUNT","MUTUAL FUND","PERSONAL LOAN"]))
+
+# Segment derivation
+def age_group(age):
+    if age < 25: return "18-24"
+    elif age < 40: return "25-39"
+    elif age < 55: return "40-54"
+    else: return "55+"
+
+def salary_band(sal):
+    if sal < 50000: return "<50K"
+    elif sal < 150000: return "50K-150K"
+    else: return "150K+"
+
+age_grp = age_group(age)
+sal_band = salary_band(salary)
+
+st.title("💳 Personalized Financial Product Recommendations")
+
+# show chosen profile
+
+
+# Function to find candidate rules
+def find_rules_for_segment(assoc_df, age_grp, sal_band, risk_profile, employment_status, current_product):
+    # 1) exact segment match & antecedent contains current_product
+    seg_rules = assoc_df[
+        (assoc_df["AGE_GROUP"] == age_grp) &
+        (assoc_df["SALARY_BAND"] == sal_band) &
+        (assoc_df["RISK_PROFILE"] == risk_profile) &
+        (assoc_df["EMPLOYMENT_STATUS"] == employment_status)
+    ]
+    def antecedent_contains(ant_str, prod):
+        items = [x.strip().lower() for x in str(ant_str).split(",") if x.strip()]
+        return prod.strip().lower() in items
+    seg_rules = seg_rules[seg_rules["ANTECEDENT"].apply(lambda x: antecedent_contains(x, current_product))]
+    if not seg_rules.empty:
+        return seg_rules.sort_values(["CONFIDENCE","SUPPORT","SCORE"], ascending=False)
+    # 2) relax: match any rule in same age group & salary band
+    seg2 = assoc_df[
+        (assoc_df["AGE_GROUP"] == age_grp) &
+        (assoc_df["SALARY_BAND"] == sal_band)
+    ]
+    seg2 = seg2[seg2["ANTECEDENT"].apply(lambda x: antecedent_contains(x, current_product))]
+    if not seg2.empty:
+        return seg2.sort_values(["CONFIDENCE","SUPPORT","SCORE"], ascending=False)
+    # 3) fallback: GLOBAL rules where antecedent contains current_product
+    global_rules = assoc_df[assoc_df["AGE_GROUP"] == "GLOBAL"]
+    global_rules = global_rules[global_rules["ANTECEDENT"].apply(lambda x: antecedent_contains(x, current_product))]
+    return global_rules.sort_values(["CONFIDENCE","SUPPORT","SCORE"], ascending=False)
+
+# Get rules
+matched_rules = find_rules_for_segment(assoc_df, age_grp, sal_band, risk_profile, employment_status, current_product)
+
+
+# Display recommendations
+st.subheader("Recommended Products")
+if matched_rules is not None and not matched_rules.empty:
+    shown = 0
+    shown_set = set()
+    for _, row in matched_rules.iterrows():
+        consequents = [c.strip() for c in str(row["CONSEQUENT"]).split(",") if c.strip()]
+        for cons in consequents:
+            if cons.lower() in shown_set:
+                continue
+            shown_set.add(cons.lower())
+            st.success(f"{cons}")  # ✅ Only show product name
+            shown += 1
+            if shown >= 5:
+                break
+        if shown >= 5:
+            break
+else:
+    st.info("No strong association rule found for this exact segment and current product. Showing global popular recommendations.")
+    globals_df = assoc_df[assoc_df["AGE_GROUP"] == "GLOBAL"].sort_values(["CONFIDENCE","SUPPORT","SCORE"], ascending=False)
+    if not globals_df.empty:
+        for _, row in globals_df.head(5).iterrows():
+            st.write(f"{row['CONSEQUENT']}")  # ✅ Only show product name
+    else:
+        st.write("No association rules available. Please run the training notebook to build PRODUCT_ASSOCIATIONS.")
+
+
+
+# Explainability
+
+# Segment insights
+
